@@ -16,15 +16,7 @@ package io.openliberty.arquillian.managed;
 
 import static java.util.logging.Level.FINER;
 
-import java.io.BufferedReader;
-import java.io.Closeable;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
-import java.io.FilenameFilter;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
+import java.io.*;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.nio.charset.StandardCharsets;
@@ -213,20 +205,31 @@ public class WLPManagedContainer implements DeployableContainer<WLPManagedContai
             if (!javaVmArguments.equals("")) {
             	cmd.addAll(parseJvmArgs(javaVmArguments));
          	}
-            cmd.add("-javaagent:lib/bootstrap-agent.jar");
+            cmd.add("-javaagent:" + containerConfiguration.getWlpHome() + "bin/tools/ws-javaagent.jar");
             cmd.add("-jar");
-            cmd.add("lib/ws-launch.jar");
+            cmd.add(containerConfiguration.getWlpHome() + "bin/tools/ws-server.jar");
             cmd.add(containerConfiguration.getServerName());
-            
+
             log.finer("Starting server with command: " + cmd.toString());
 
+             /******
+              * Basically takes the aggregated cmd string and runs it through a OS Process builder to start the
+              * Liberty server.
+              */
             ProcessBuilder pb = new ProcessBuilder(cmd);
+            //****** Sets the process working directory
             pb.directory(new File(containerConfiguration.getWlpHome()));
+
+            //****** Sets the processbuilder environment
+            parseServerEnv(pb.environment());
+
+            //****** if true This makes it easier to correlate error messages with the corresponding output.
             pb.redirectErrorStream(true);
             wlpProcess = pb.start();
 
             new Thread(new ConsoleConsumer()).start();
 
+            //******* ???
             final Process proc = wlpProcess;
             shutdownThread = new Thread(new Runnable() {
                 @Override
@@ -244,6 +247,10 @@ public class WLPManagedContainer implements DeployableContainer<WLPManagedContai
             Runtime.getRuntime().addShutdownHook(shutdownThread);
 
             // Wait up to 30s for the server to start
+             /******
+              * FOR every 500ms, Check if getVMLocalConnectorAddress returns a serviceURL, which would indicate
+              * the service having been started.
+              */
             int startupTimeout = containerConfiguration.getServerStartTimeout() * 1000;
             while (startupTimeout > 0 && serviceURL == null) {
                startupTimeout -= 500;
@@ -282,8 +289,16 @@ public class WLPManagedContainer implements DeployableContainer<WLPManagedContai
          throw new LifecycleException("Could not start container", e);
       }
 
+       /******
+        * When the server is started and a VMLocalConnectorAddress is retreived, attempt to register in in JMX Agent.
+        */
       try {
          JMXServiceURL url = new JMXServiceURL(serviceURL);
+          /******
+           * Client end of the JMX-API connector, JMX ServiceUrl is used to connect to the started server.
+           * Connection of which is then used to fetch the MBeanServerConnection, an interface to talk to an MBean
+           * server (JMX Agent).
+           */
          jmxConnector = JMXConnectorFactory.connect(url);
          mbsc = jmxConnector.getMBeanServerConnection();
       } catch (IOException e) {
@@ -295,7 +310,64 @@ public class WLPManagedContainer implements DeployableContainer<WLPManagedContai
       }
    }
 
-	private List<String> parseJvmArgs(String javaVmArguments) {
+    /***
+     * Searches and parses existant server.env files to the ProcessBuilder.environment prior to server start-up
+     *
+     * The server management script searches for server.env files in two locations:
+     * ${wlp.install.dir}/etc/server.env and ${server.config.dir}/server.env. If both files are present, the
+     * contents of the two files are merged; values in the server-level file take precedence over values in the
+     * runtime-level file.
+     *
+     * The allowed server.env variables shall be alphanumeric with possible underscores
+     * {@link [com.ibm.ws.kernel.boot.ws-server.]server.bat[#readServerEnv()]}
+     *
+     * @param environment
+     * @throws LifecycleException
+     * @throws IOException
+     */
+    private void parseServerEnv(Map<String, String> environment) throws LifecycleException, IOException {
+        log.finer("Attempting to parse server.env");
+        Properties props = new Properties();
+
+        // We only allow alphanumeric values with underscores @see
+        String alphaNumPattern = "[a-zA-z0-9\\s]*"; //Check if necessary
+
+        // Server-level server.env loaded last
+        loadServerEnvToProps(props, getSystemServerEnvFilename());
+        loadServerEnvToProps(props, getServerEnvFilename());
+
+        // Parse properties and add them to ProcessBuilder.environment
+        Set<String> keys = props.stringPropertyNames();
+        for(String key : keys){
+            String value = props.getProperty(key);
+            if(key.matches(alphaNumPattern) && value.matches(alphaNumPattern))
+                environment.put(key, props.getProperty(key));
+            else
+                throw new LifecycleException("Non alphanumeric values in server.env not allowed! ( " + key + " = " + value + " )");
+        }
+    }
+
+    /***
+     * Finds and loads server.env files to a Properties holder.
+     *
+     * @param props
+     * @param serverEnvFile
+     * @throws LifecycleException
+     */
+    private void loadServerEnvToProps(Properties props, String serverEnvFile) throws LifecycleException {
+
+        try (InputStream fisServerEnv = new FileInputStream(new File(serverEnvFile))) {
+            props.load(fisServerEnv);
+
+        } catch (FileNotFoundException ex) {
+            //We can silently ignore this, no server.env file is allowed.
+            log.finer("Server specific server.env not found");
+        } catch (IOException ioEx) {
+            throw new LifecycleException("Error while parsing server.env file", ioEx);
+        }
+    }
+
+    private List<String> parseJvmArgs(String javaVmArguments) {
 		List<String> parsedJavaVmArguments = new ArrayList<String>();
 		String[] splitJavaVmArguments = javaVmArguments.split(javaVmArgumentsDelimiter);
 		if (splitJavaVmArguments.length > 1) {
@@ -1134,6 +1206,9 @@ public class WLPManagedContainer implements DeployableContainer<WLPManagedContai
             }
          }
          // Liberty system wide not used for things that would collide across >1 server like LOG_DIR
+          /******
+           * The issue is that if WLP_USER_DIR is not specified as a process
+           */
          if (value == null && !key.equals(LOG_DIR)) {
             try {
                fisSystemServerEnv = new FileInputStream(new File(getSystemServerEnvFilename()));
@@ -1637,6 +1712,9 @@ public class WLPManagedContainer implements DeployableContainer<WLPManagedContai
     */
    private String getWlpUsrDir() throws IOException {
       String usrDir = getLibertyEnvVar(WLP_USER_DIR);
+       /******
+        * Will probably always result in null
+        */
       if (usrDir == null) {
          usrDir = containerConfiguration.getWlpHome() + "/usr/";
       }
@@ -1892,6 +1970,7 @@ public class WLPManagedContainer implements DeployableContainer<WLPManagedContai
                byte[] buf = new byte[32];
                int num;
                // Do not try reading a line cos it considers '\r' end of line
+               //****** If no byte is available because the stream is at the end of the file, the value <code>-1</code> is returned;
                while ((num = stream.read(buf)) != -1) {
                    if (writeOutput)
                        System.out.write(buf, 0, num);
